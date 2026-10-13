@@ -50,7 +50,9 @@ Cada clique em **Sortear** realiza um novo sorteio independente. A aleatoriedade
 
 Os resultados e mudanças de grupo são salvos no SQL Server `WK-245`, no banco `SorteioDB`. A lista que alimenta o próximo sorteio permanece no armazenamento local do navegador (`localStorage`), usando a chave `sorteio.participantes.v1`; ela não é sincronizada entre dispositivos. O tema escolhido também fica salvo localmente.
 
-As tabelas são `dbo.Sorteios` (tipo, data/hora e quantidade), `dbo.SorteioParticipantes` (nome, grupo e ordem no resultado) e `dbo.SorteioAlteracoes` (grupo de origem/destino e data/hora da movimentação). A view `dbo.vwHistoricoSorteios` reúne ID, nome, grupo, tipo e data/hora em uma consulta. A API registra sorteio e participantes na mesma transação.
+Cada sorteio, participante e alteração é associado ao `UsuarioID` autenticado. O histórico e o resultado atual mostram somente registros do usuário logado, e a API impede movimentar participantes de outra conta. Registros anteriores à autenticação permanecem com `UsuarioID` nulo e não são exibidos no histórico de nenhum usuário, pois não há autoria confiável para atribuí-los. Na migração deste ambiente, 32 sorteios, 252 participantes e 19 alterações permaneceram sem proprietário; os dados continuam preservados no banco.
+
+As tabelas são `dbo.Sorteios` (usuário, tipo, data/hora e quantidade), `dbo.SorteioParticipantes` (sorteio, usuário, nome, grupo e ordem no resultado) e `dbo.SorteioAlteracoes` (sorteio, usuário, grupo de origem/destino e data/hora da movimentação). A view `dbo.vwHistoricoSorteios` inclui os IDs de usuário do sorteio e do participante. A API registra sorteio e participantes na mesma transação.
 
 ## Estrutura e stacks
 
@@ -65,9 +67,11 @@ O projeto é dividido em frontend, API e banco de dados:
 Arquivos principais:
 
 - `client/src/App.jsx`: interface React, validação e interação com a API.
+- `client/src/AuthScreen.jsx`: telas de login, cadastro, recuperação de senha e perfil.
 - `client/src/styles.css`: estilos responsivos e temas claro/escuro.
 - `server/app.js`: rotas Express e entrega da interface compilada.
-- `server/drawRepository.js`: consultas, validações e transações de sorteios e histórico.
+- `server/authRepository.js`: cadastro, validação de credenciais, hash `scrypt` e sessões persistidas.
+- `server/drawRepository.js`: consultas, validações e transações de sorteios, filtradas por usuário.
 - `server/db.js`: conexão integrada com o SQL Server `WK-245` via ODBC Driver 18.
 - `Sorteio-Banco.sql`: criação idempotente do banco `SorteioDB`, tabelas, índices e view de consulta.
 - `Iniciar-Sorteio.bat`: instala dependências se necessário, compila a interface e inicia a aplicação Node.
@@ -78,13 +82,34 @@ O Node.js 22.12+ e npm são necessários. O pacote nativo `msnodesqlv8` usa o OD
 
 ### Caminho de uma operação
 
-1. O navegador valida os dados e escolhe os participantes por meio de `crypto.getRandomValues()` e Fisher–Yates.
-2. O JavaScript envia o resultado em JSON para `POST /api/draw`.
-3. O Express valida os campos e grava o cabeçalho do sorteio e os participantes em uma única transação SQL.
-4. O cliente consulta `GET /api/current` e redesenha o resultado com o ID persistido de cada participante.
-5. Ao arrastar alguém para outro grupo, o navegador chama `PUT /api/participants/{id}/move`; o backend atualiza o grupo e insere a auditoria na mesma transação.
+1. O navegador envia as credenciais; o servidor verifica hashes `scrypt` e cria uma sessão em cookie `HttpOnly`.
+2. O navegador valida a lista e escolhe os participantes por meio de `crypto.getRandomValues()` e Fisher–Yates.
+3. O JavaScript envia o resultado em JSON para `POST /api/draw`; o Express obtém o `UsuarioID` da sessão, nunca do corpo enviado pelo navegador.
+4. O servidor grava sorteio e participantes com o mesmo `UsuarioID`, em uma transação SQL.
+5. `GET /api/current` e `GET /api/history` filtram sorteios, participantes e alterações pelo usuário autenticado.
+6. Ao arrastar alguém para outro grupo, `PUT /api/participants/{id}/move` confirma a autoria e grava a alteração para o mesmo usuário, na mesma transação.
 
 Os nomes mostrados na tela são inseridos como texto, não como HTML, para evitar que caracteres especiais sejam interpretados como marcação.
+
+## Contas de usuário
+
+Execute `Sorteio-Banco.sql` com uma conta autorizada no SQL Server. O script é idempotente e cria as tabelas `dbo.Usuarios` e `dbo.Sessoes`, além de adicionar `UsuarioID` a `dbo.Sorteios`, `dbo.SorteioParticipantes` e `dbo.SorteioAlteracoes`. Ele também atualiza a view `dbo.vwHistoricoSorteios`. O cadastro salva hashes `scrypt` com salt individual para senha e palavra-chave. A sessão usa cookie `HttpOnly`, com token armazenado no banco somente como hash. Histórico, sorteio, perfil e movimentação exigem sessão ativa. A recuperação de senha valida a palavra-chave cadastrada e não envia e-mail.
+
+Os `UsuarioID` dos registros novos são chaves estrangeiras para `dbo.Usuarios`. Os campos aceitam `NULL` para preservar registros legados sem atribuir a uma conta uma autoria que o banco antigo não registrava. Esses registros não são retornados pelas consultas autenticadas.
+
+Rotas de conta: `GET /api/auth/session`, `GET /api/auth/username`, `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/forgot`, `POST /api/auth/logout` e `PUT /api/auth/profile`.
+
+### Tela de login e conta
+
+Ao abrir a aplicação, o cliente consulta `GET /api/auth/session`. Se não houver sessão válida, exibe a tela **Entrar**, com os campos de nome de usuário e senha, além das opções **Criar conta** e **Esqueci a senha**. Se as credenciais não corresponderem, a mensagem é apresentada junto ao campo correspondente: **usuário não cadastrado** ou **senha incorreta**.
+
+Em **Criar conta**, o nome é consultado no banco ao sair do campo. Enquanto a consulta acontece, a tela informa **Verificando usuário...**; depois mostra **usuário válido** em verde ou **usuário já cadastrado** em vermelho. O cadastro também pede senha, confirmação e palavra-chave de recuperação. Senhas diferentes são recusadas; após um cadastro aceito, a conta entra automaticamente.
+
+Em **Esqueci a senha**, o usuário informa nome, palavra-chave cadastrada e nova senha com confirmação. A alteração só é concluída quando usuário e palavra-chave forem validados. Não há envio de e-mail.
+
+Em **Meu perfil**, o usuário pode alterar o nome de usuário e a senha. Para trocar a senha, precisa informar a senha atual e confirmar a nova. **Logout** invalida a sessão no servidor e retorna à tela de entrada. O formulário preserva os temas claro e escuro da aplicação.
+
+As senhas e palavras-chave são derivadas com `scrypt` e salts aleatórios individuais; não são armazenadas em texto puro. O navegador recebe um token de sessão aleatório em cookie `HttpOnly`; somente o hash do token é persistido no SQL Server. A sessão expira após sete dias, e as rotas protegidas validam sua associação ao usuário antes de consultar ou alterar dados.
 
 ## API HTTP
 
@@ -94,14 +119,21 @@ A API é servida pela mesma origem da página em `http://localhost:8765`; isso e
 | --- | --- | --- |
 | `GET /` | Entregar a interface React compilada. | HTML da aplicação. |
 | `GET /api/health` | Testar conexão com o banco. | `{"ok":true,"server":"wk-245","database":"SorteioDB"}`. |
-| `GET /api/current` | Buscar o sorteio mais recente. | Um objeto de sorteio ou `null` quando ainda não existem registros. |
-| `GET /api/history` | Buscar sorteios, participantes e auditoria em ordem mais recente primeiro. | Array de objetos de sorteio. |
-| `POST /api/draw` | Gravar sorteio e seus participantes. | HTTP `201` e `{ "id": <id do sorteio> }`. |
-| `PUT /api/participants/{id}/move` | Mover participante para outro grupo. | `{ "moved": true }`; retorna `false` se já pertencer ao grupo. |
+| `GET /api/auth/session` | Consultar a sessão atual. | Usuário autenticado ou `null`. |
+| `GET /api/auth/username` | Verificar disponibilidade do nome de usuário. | `{ "exists": boolean }`. |
+| `POST /api/auth/register` | Criar conta e iniciar sessão. | HTTP `201` e usuário criado. |
+| `POST /api/auth/login` | Validar credenciais e iniciar sessão. | Usuário autenticado. |
+| `POST /api/auth/forgot` | Redefinir senha com palavra-chave válida. | `{ "ok": true }`. |
+| `POST /api/auth/logout` | Encerrar sessão atual. | `{ "ok": true }`. |
+| `PUT /api/auth/profile` | Atualizar usuário e/ou senha. | Usuário atualizado. |
+| `GET /api/current` | Buscar o sorteio mais recente do usuário autenticado. | Um objeto próprio ou `null` quando ainda não existem registros. |
+| `GET /api/history` | Buscar sorteios, participantes e auditoria do usuário autenticado, em ordem mais recente primeiro. | Array dos sorteios próprios. |
+| `POST /api/draw` | Gravar sorteio e seus participantes para o usuário autenticado. | HTTP `201` e `{ "id": <id do sorteio> }`. |
+| `PUT /api/participants/{id}/move` | Mover participante de um sorteio próprio para outro grupo. | `{ "moved": true }`; retorna `false` se já pertencer ao grupo e `404` se não pertencer ao usuário. |
 
 Um objeto retornado pelas rotas de consulta inclui `id`, `type`, `date`, `total`, `participants` e `changes`. Cada participante inclui `id`, `name`, `group` e `order`; cada alteração inclui participante, grupo anterior, grupo de destino e data/hora.
 
-Erros são respondidos como JSON no formato `{ "error": "mensagem" }`. Rotas inexistentes respondem `404`; falhas de validação respondem `400` e falhas de banco respondem `500`. A API não implementa autenticação HTTP: ela é destinada a uso local. O acesso ao banco usa as credenciais Windows da conta que executa o Node.
+Erros são respondidos como JSON no formato `{ "error": "mensagem" }`. Rotas inexistentes respondem `404`; falhas de validação respondem `400`, sessão ausente responde `401` e falhas de banco respondem `500`. Todas as rotas de sorteio e perfil exigem sessão, e o servidor deriva o proprietário da sessão validada. Consultas de disponibilidade de usuário usam `Cache-Control: no-store`. O acesso ao banco usa as credenciais Windows da conta que executa o Node.
 
 ## Banco de dados
 
@@ -109,12 +141,14 @@ O script cria o banco `SorteioDB` no servidor `WK-245` e pode ser executado nova
 
 | Objeto | Conteúdo |
 | --- | --- |
-| `dbo.Sorteios` | `ID`, `TipoSorteio` (`individual`, `groups` ou `pairs`), `DataHora` (hora local do servidor SQL), `QuantidadeParticipantes`. |
-| `dbo.SorteioParticipantes` | `ID`, `SorteioID`, `Nome`, `Grupo` e `Ordem` de exibição. Um registro por participante efetivamente exibido no resultado; no modo individual, guarda o vencedor. |
-| `dbo.SorteioAlteracoes` | `ID`, `SorteioID`, `ParticipanteID`, `Nome`, `GrupoOrigem`, `GrupoDestino` e `DataHora`; cada movimento efetivo gera uma linha de auditoria. |
-| `dbo.vwHistoricoSorteios` | View que junta participante e sorteio para consultar ID, nome, grupo, tipo, data/hora, quantidade e ordem. |
+| `dbo.Sorteios` | `ID`, `UsuarioID`, `TipoSorteio` (`individual`, `groups` ou `pairs`), `DataHora` (hora local do servidor SQL), `QuantidadeParticipantes`. |
+| `dbo.SorteioParticipantes` | `ID`, `SorteioID`, `UsuarioID`, `Nome`, `Grupo` e `Ordem` de exibição. Um registro por participante efetivamente exibido no resultado; no modo individual, guarda o vencedor. |
+| `dbo.SorteioAlteracoes` | `ID`, `SorteioID`, `UsuarioID`, `ParticipanteID`, `Nome`, `GrupoOrigem`, `GrupoDestino` e `DataHora`; cada movimento efetivo gera uma linha de auditoria. |
+| `dbo.Usuarios` | Nome de usuário, hashes `scrypt` e salts individuais da senha e palavra-chave de recuperação. |
+| `dbo.Sessoes` | Hash do token de sessão, usuário associado e horário de expiração. |
+| `dbo.vwHistoricoSorteios` | View que junta participante e sorteio para consultar IDs de usuário, ID, nome, grupo, tipo, data/hora, quantidade e ordem. |
 
-As tabelas têm chaves estrangeiras e índices para recuperar participantes e alterações por sorteio. A gravação do sorteio com seus participantes e a mudança de grupo com sua auditoria são transacionais: ou todas as operações correspondentes são confirmadas, ou são desfeitas.
+As tabelas têm chaves estrangeiras e índices para recuperar dados por usuário e sorteio. A gravação do sorteio com seus participantes e a mudança de grupo com sua auditoria são transacionais: ou todas as operações correspondentes são confirmadas, ou são desfeitas. A autoria é verificada também na movimentação, de modo que conhecer o ID de um participante não permite alterar dados de outra conta.
 
 Para recriar o esquema em uma instalação autorizada, execute `sqlcmd -S wk-245 -E -i Sorteio-Banco.sql`. Esse comando usa autenticação integrada do Windows; não contém senha no arquivo.
 
@@ -137,6 +171,9 @@ O formulário e a lista de entrada permanecem no navegador. O salvamento automá
 - **Duplas ímpares:** informe 5 participantes; confirme 2 duplas, uma pessoa em **Sem dupla** e o pop-up correspondente.
 - **Validação:** tente criar mais grupos que participantes ou sortear duplas com apenas um nome; o aplicativo deve apresentar uma mensagem de erro.
 - **Persistência:** recarregue a página e confirme que o resultado mais recente continua visível; confira também a lista de entrada salva localmente.
+- **Isolamento:** crie sorteios em duas contas diferentes; confirme que o histórico e o resultado atual de cada uma mostram somente seus próprios dados.
+- **Movimentação isolada:** tente mover o participante de outra conta; a API deve responder `404` e não gravar alteração.
+- **Contas:** cadastre uma conta, encerre a sessão, entre novamente e confira o perfil e a recuperação de senha.
 - **Tema e confirmação:** faça um sorteio em tema claro e em tema escuro; confirme contraste legível no aviso de salvamento.
 
 ## Limitações e observações
@@ -252,4 +289,85 @@ Ao final, gere um markdown explicando o projeto, por gentileza (incluindo as exp
 
 ```text
 Pode incluir os prompts utilizados hoje no markdown também.
+```
+
+### 10. Login, cadastro e perfil — 13/10/2026
+
+```text
+Gostaria que de incluir uma tela de login para o nosso projeto de sorteio.
+
+As informações do login principal deverão ser básicas:
+- nome de usuário - validação se o usuário está inserido no banco (caso não esteja, exibir a mensagem abaixo do campo em vermelho "usuário não cadastrado");
+- senha - validação se a senha está correta, conforme a criptografia do banco (caso não esteja, exibir a mensagem abaixo do campo em vermelho "senha incorreta").
+
+As informações deverão ser gravadas na tabela, utilizando uma criptografia para a senha.
+
+Deverá conter também uma opção para o cadastro incial, caso o usuário não possua uma conta, e uma opção de esqueci a senha.
+
+Cadastro incial:
+informações necessárias:
+- nome de usuário - realizar a validação se o nome de usuário já não existir cadastrado a tabela (se já existir: exibir a mensagem informativa abaixo do campo na coloração vermelha - "usuário já cadastrado"), (se não existir, exibir a mensagem abaixo do campo na coloração verde - "usuário válido");
+- senha: cadastro da senha do usuário, permitidos todos os tipos de caracteres;
+- confirmação de senha: campo para o usuário informar a senha novamente para validação.
+- Palavra chave para esquecimento de senha: nesse campo, o usuário deverá informar uma palavra a utilizar no caso de esquecimento de senha (servirá como uma validação de que é ele mesmo quem solicita a alteração, já que não iremos disparar emails para a alteração)
+- Botão "Cadastar": ao apertar o botão as informações serão inseridas na tabela e o usuário será direcionado para a tela inicial do sorteador.
+
+Esqueci a senha:
+informações necessárias:
+- nome de usuário - validação se o usuário está inserido no banco (caso não esteja, exibir a mensagem abaixo do campo em vermelho "usuário não cadastrado")
+- palavra chave - validação da palavra chave cadastrada no banco de acordo com o usuário informado (caso não esteja, exibir a mensagem abaixo do campo em vermelho "palavra chave incorreta")
+- nova senha:
+- confirmação de senha:
+
+A senha só poderá ser trocada caso todas as informações estejam validadas de acordo com o informado no banco.
+
+No menu inicial do sorteador, deverá ser incluído os menus:
+
+Logout - ao clicar o usuário será redirecionado para o menu de login incial, saindo da sua conta;
+Meu perfil - exibir as informações:
+nome de usuário:
+alterar senha:
+Ambas as informações do menu Meu perfil poderão ser alteradas, onde ao realizar as alterações, as informações deverão obrigatóriamente ser alteradas no banco também.
+
+Mantenha as mesmas fontes, e tonalidades já utilizadas no projeto, prezando pelos temas claro e escuro, conforme já acontece.
+
+Continue utilizando node e react.
+```
+
+### 11. Validação de foco no cadastro — 13/10/2026
+
+```text
+na tela de cadastro incial, após preencher todos os campos corretamente, clicar em cima do nome de usuario e clicar fora do campo ou em outro campo, está havendo uma leve falha de exibição na mensagem de validação. Aparece a mensagem usuário já cadastrado rapidamente, antes da exibição correta de usuário válido.
+Corrija o apontamento e verifique se nos demais campos está acontecendo a mesma coisa, por gentileza. Caso esteja, já realize as correções necessárias.
+```
+
+### 12. Persistência da falha de foco — 13/10/2026
+
+```text
+a falha de foco ainda continua nesses ms na tela.
+```
+
+### 13. Novo status HTTP observado — 13/10/2026
+
+```text
+continua com o mesmo apontamento, porém, agora é o status 200
+```
+
+### 14. Histórico isolado por usuário — 13/10/2026
+
+~~~text
+O histórico de sorteios deverá ser mantido por usuário, não exibindo se o usuário logado não for quem realizou o sorteio.
+Pode relizar a alteração também nas tabela, dando um alter table add column usuario nas tabelas e views:
+```
+Sorteios
+SorteioParticipantes
+SorteioAlteracoes
+vwHistoricoSorteios
+```
+~~~
+
+### 15. Atualização da documentação — 13/10/2026
+
+```text
+atualize o markdown com as informações atuais do projeto, adicione também os prompts utilizados hoje
 ```

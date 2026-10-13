@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { AuthScreen, ProfileView } from "./AuthScreen.jsx";
 
 const NAMES_KEY = "sorteio.participantes.v1";
 const THEME_KEY = "sorteio.tema.v1";
@@ -181,6 +182,8 @@ export default function App() {
   const [notice, setNotice] = useState(null);
   const [saving, setSaving] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState("Verificando banco...");
+  const [authUser, setAuthUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const noticeRef = useRef(null);
   const toastTimer = useRef(null);
   const people = names.split(/\r?\n/).map(name => name.trim()).filter(Boolean);
@@ -197,19 +200,41 @@ export default function App() {
 
   useEffect(() => {
     const dialog = noticeRef.current;
+    if (!dialog) return;
     if (notice && !dialog.open) dialog.showModal();
     if (!notice && dialog.open) dialog.close();
   }, [notice]);
 
   useEffect(() => {
-    api("/api/health").then(async () => {
-      setConnectionStatus("SQL Server WK-245");
-      setDraw(await api("/api/current"));
-    }).catch(error => {
+    api("/api/auth/session").then(async ({ user }) => {
+      setAuthUser(user);
+      if (user) {
+        try {
+          const health = await api("/api/health");
+          setConnectionStatus(`SQL Server ${health.server}`);
+          setDraw(await api("/api/current"));
+        } catch (requestError) {
+          setConnectionStatus("Banco indisponível");
+          showToast(requestError.message);
+        }
+      }
+    }).catch(requestError => {
       setConnectionStatus("Banco indisponível");
-      showToast(error.message);
-    });
+      showToast(requestError.message);
+    }).finally(() => setAuthLoading(false));
   }, []);
+
+  async function logout() {
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+      setAuthUser(null);
+      setDraw(null);
+      setDraws([]);
+      setView("draw");
+    } catch (requestError) {
+      showToast(requestError.message);
+    }
+  }
 
   function showToast(message) {
     setToast(message);
@@ -326,6 +351,15 @@ export default function App() {
     ? `${draw.total} participantes`
     : "";
 
+  if (authLoading || !authUser) return <div className="shell">
+    <header className="topbar">
+      <a className="brand" href="#inicio" aria-label="Sorteio, início"><span className="brand-mark">S</span><span>Sorteio</span></a>
+      <div className="topbar-tools"><span className="top-note">{authLoading ? "Verificando sessão..." : ""}</span><button className="theme-button" type="button" aria-label={theme === "dark" ? "Ativar modo claro" : "Ativar modo escuro"} title="Alternar tema" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}><Icon name={theme === "dark" ? "sun" : "moon"} /></button></div>
+    </header>
+    <main>{authLoading ? <div className="auth-loading" role="status">Carregando...</div> : <AuthScreen onAuthenticated={user => { setAuthUser(user); setConnectionStatus("Conectando ao banco..."); api("/api/health").then(async health => { setConnectionStatus(`SQL Server ${health.server}`); setDraw(await api("/api/current")); }).catch(requestError => { setConnectionStatus("Banco indisponível"); showToast(requestError.message); }); }} />}</main>
+    <div className={`toast ${toast ? "show" : ""}`} role="status" aria-live="polite">{toast}</div>
+  </div>;
+
   return <div className="shell">
     <header className="topbar">
       <a className="brand" href="#inicio" aria-label="Sorteio, início"><span className="brand-mark">S</span><span>Sorteio</span></a>
@@ -342,6 +376,10 @@ export default function App() {
           <div className="nav-section">
             <button className={`nav-item ${view === "history" ? "active" : ""}`} type="button" aria-expanded={view === "history"} onClick={openHistory}><Icon name="history" /><span>Histórico de sorteios</span><Icon name="chevron" /></button>
             {view === "history" && <div className="nav-children"><button className="nav-child" type="button" onClick={() => document.getElementById("history-title")?.scrollIntoView({ behavior: "smooth" })}>Todos os sorteios</button><button className="nav-child" type="button" onClick={() => document.getElementById("history-changes")?.scrollIntoView({ behavior: "smooth" })}>Alterações de grupos</button></div>}
+          </div>
+          <div className="nav-section account-nav">
+            <button className={`nav-item ${view === "profile" ? "active" : ""}`} type="button" onClick={() => setView("profile")}><span>Meu perfil</span></button>
+            <button className="nav-item" type="button" onClick={logout}><span>Logout</span></button>
           </div>
         </nav>
         <div className="app-content">
@@ -368,7 +406,7 @@ export default function App() {
               </section>
             </div>
             <p className="footnote">Sorteios e alterações ficam gravados no SQL Server WK-245.</p>
-          </> : <HistoryView draws={draws} summary={`${draws.length} ${draws.length === 1 ? "sorteio registrado" : "sorteios registrados"}`} onRefresh={() => loadHistory().catch(requestError => showToast(requestError.message))} onShowCurrent={showCurrent} onMove={moveParticipant} />}
+          </> : view === "history" ? <HistoryView draws={draws} summary={`${draws.length} ${draws.length === 1 ? "sorteio registrado" : "sorteios registrados"}`} onRefresh={() => loadHistory().catch(requestError => showToast(requestError.message))} onShowCurrent={showCurrent} onMove={moveParticipant} /> : <ProfileView user={authUser} onUpdated={setAuthUser} showToast={showToast} />}
         </div>
       </div>
     </main>

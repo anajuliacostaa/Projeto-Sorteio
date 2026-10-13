@@ -27,23 +27,29 @@ function toDraw(header, participants, changes) {
   };
 }
 
-export async function getHistory() {
+export async function getHistory(userId) {
   const pool = await getPool();
   const [draws, participants, changes] = await Promise.all([
-    pool.request().query(`
+    pool.request().input("userId", sql.Int, userId).query(`
       SELECT ID, TipoSorteio,
         CONVERT(nvarchar(19), DataHora, 126) AS DataHora,
         QuantidadeParticipantes
-      FROM dbo.Sorteios ORDER BY DataHora DESC, ID DESC;
+      FROM dbo.Sorteios
+      WHERE UsuarioID = @userId
+      ORDER BY DataHora DESC, ID DESC;
     `),
-    pool.request().query(`
+    pool.request().input("userId", sql.Int, userId).query(`
       SELECT ID, SorteioID, Nome, Grupo, Ordem
-      FROM dbo.SorteioParticipantes ORDER BY SorteioID DESC, Ordem;
+      FROM dbo.SorteioParticipantes
+      WHERE UsuarioID = @userId
+      ORDER BY SorteioID DESC, Ordem;
     `),
-    pool.request().query(`
+    pool.request().input("userId", sql.Int, userId).query(`
       SELECT ID, SorteioID, ParticipanteID, Nome, GrupoOrigem, GrupoDestino,
         CONVERT(nvarchar(19), DataHora, 126) AS DataHora
-      FROM dbo.SorteioAlteracoes ORDER BY SorteioID DESC, DataHora, ID;
+      FROM dbo.SorteioAlteracoes
+      WHERE UsuarioID = @userId
+      ORDER BY SorteioID DESC, DataHora, ID;
     `)
   ]);
 
@@ -52,7 +58,10 @@ export async function getHistory() {
   );
 }
 
-export async function saveDraw(body) {
+export async function saveDraw(body, userId) {
+  if (!Number.isSafeInteger(userId) || userId < 1) {
+    throw Object.assign(new Error("Usuário inválido."), { statusCode: 401 });
+  }
   const allowedTypes = new Set(["individual", "groups", "pairs"]);
   if (!body || !allowedTypes.has(body.type)) {
     throw Object.assign(new Error("Tipo de sorteio inválido."), { statusCode: 400 });
@@ -84,24 +93,26 @@ export async function saveDraw(body) {
   await transaction.begin();
   try {
     const header = await new sql.Request(transaction)
+      .input("userId", sql.Int, userId)
       .input("type", sql.NVarChar(20), body.type)
       .input("total", sql.Int, total)
       .query(`
-        INSERT dbo.Sorteios (TipoSorteio, QuantidadeParticipantes)
+        INSERT dbo.Sorteios (UsuarioID, TipoSorteio, QuantidadeParticipantes)
         OUTPUT INSERTED.ID
-        VALUES (@type, @total);
+        VALUES (@userId, @type, @total);
       `);
     const drawId = header.recordset[0].ID;
 
     for (const person of people) {
       await new sql.Request(transaction)
         .input("drawId", sql.BigInt, drawId)
+        .input("userId", sql.Int, userId)
         .input("name", sql.NVarChar(250), person.name.trim())
         .input("group", sql.NVarChar(100), person.group ?? null)
         .input("order", sql.Int, person.order)
         .query(`
-          INSERT dbo.SorteioParticipantes (SorteioID, Nome, Grupo, Ordem)
-          VALUES (@drawId, @name, @group, @order);
+          INSERT dbo.SorteioParticipantes (SorteioID, UsuarioID, Nome, Grupo, Ordem)
+          VALUES (@drawId, @userId, @name, @group, @order);
         `);
     }
 
@@ -113,9 +124,12 @@ export async function saveDraw(body) {
   }
 }
 
-export async function moveParticipant(participantId, destination) {
+export async function moveParticipant(participantId, destination, userId) {
   if (!Number.isSafeInteger(participantId) || participantId < 1) {
     throw Object.assign(new Error("Participante não encontrado."), { statusCode: 404 });
+  }
+  if (!Number.isSafeInteger(userId) || userId < 1) {
+    throw Object.assign(new Error("Usuário inválido."), { statusCode: 401 });
   }
   if (typeof destination !== "string" || !destination.trim() || destination.length > 100) {
     throw Object.assign(new Error("Informe um grupo de destino válido."), { statusCode: 400 });
@@ -127,10 +141,14 @@ export async function moveParticipant(participantId, destination) {
   try {
     const result = await new sql.Request(transaction)
       .input("id", sql.BigInt, participantId)
+      .input("userId", sql.Int, userId)
       .query(`
-        SELECT SorteioID, Nome, Grupo
-        FROM dbo.SorteioParticipantes WITH (UPDLOCK, ROWLOCK)
-        WHERE ID = @id;
+        SELECT participante.SorteioID, participante.Nome, participante.Grupo
+        FROM dbo.SorteioParticipantes AS participante WITH (UPDLOCK, ROWLOCK)
+        INNER JOIN dbo.Sorteios AS sorteio ON sorteio.ID = participante.SorteioID
+        WHERE participante.ID = @id
+          AND participante.UsuarioID = @userId
+          AND sorteio.UsuarioID = @userId;
       `);
     const participant = result.recordset[0];
     if (!participant) {
@@ -144,15 +162,16 @@ export async function moveParticipant(participantId, destination) {
 
     await new sql.Request(transaction)
       .input("id", sql.BigInt, participantId)
+      .input("userId", sql.Int, userId)
       .input("drawId", sql.BigInt, participant.SorteioID)
       .input("name", sql.NVarChar(250), participant.Nome)
       .input("source", sql.NVarChar(100), participant.Grupo)
       .input("destination", sql.NVarChar(100), destination)
       .query(`
-        UPDATE dbo.SorteioParticipantes SET Grupo = @destination WHERE ID = @id;
+        UPDATE dbo.SorteioParticipantes SET Grupo = @destination WHERE ID = @id AND UsuarioID = @userId;
         INSERT dbo.SorteioAlteracoes
-          (SorteioID, ParticipanteID, Nome, GrupoOrigem, GrupoDestino)
-        VALUES (@drawId, @id, @name, @source, @destination);
+          (SorteioID, UsuarioID, ParticipanteID, Nome, GrupoOrigem, GrupoDestino)
+        VALUES (@drawId, @userId, @id, @name, @source, @destination);
       `);
 
     await transaction.commit();
